@@ -13,7 +13,7 @@ using Steamworks.Data;
 
 namespace NekogiriMod
 {
-    [BepInPlugin("kirigiri.repo.nekogiri", "Nekogiri", "1.1.0.3")]
+    [BepInPlugin("kirigiri.repo.nekogiri", "Nekogiri", "1.1.0.4")]
     public class NekogiriMod : BaseUnityPlugin
     {
         private void Awake()
@@ -52,17 +52,28 @@ namespace NekogiriMod
                 AccessTools.Method(typeof(MenuPageMain), "Start"),
                 nameof(MenuPageMainStartPrefix), false);
 
-            // The auth-ticket entry point differs between game versions.
-            Type steamPlatformType = AccessTools.TypeByName("Platforms.Steam.SteamPlatform");
-            MethodBase authMethod = steamPlatformType == null ? null : AccessTools.Method(steamPlatformType, "SetPhotonAuthTicket");
-            if (authMethod == null)
-            {
-                Type steamManagerType = AccessTools.TypeByName("SteamManager");
-                authMethod = steamManagerType == null ? null : AccessTools.Method(steamManagerType, "SendSteamAuthTicket");
-            }
-            PatchIfPresent(harmony, authMethod, nameof(AuthTicketPrefix), false);
+            // v0.5.0 no longer exposes the old SetPhotonAuthTicket/SendSteamAuthTicket
+            // entry points with the old parameterless signatures. Patch the final
+            // Photon authentication operation instead, so our AuthValues are applied
+            // immediately before Photon sends them to the Name Server.
+            Type loadBalancingClientType = AccessTools.TypeByName("Photon.Realtime.LoadBalancingClient");
+            int authPatchCount = PatchAllNamedMethods(
+                harmony, loadBalancingClientType, "OpAuthenticate", nameof(PhotonOpAuthenticatePrefix));
+            authPatchCount += PatchAllNamedMethods(
+                harmony, loadBalancingClientType, "OpAuthenticateOnce", nameof(PhotonOpAuthenticatePrefix));
 
-            Logger.LogInfo("Nekogiri v1.1.0.2 patches installed for the current game version.");
+            // Fallback for a future PUN version where the authentication operation has been renamed.
+            if (authPatchCount == 0)
+            {
+                Type photonNetworkType = typeof(PhotonNetwork);
+                authPatchCount = PatchAllNamedMethods(
+                    harmony, photonNetworkType, "ConnectUsingSettings", nameof(PhotonConnectPrefix));
+            }
+
+            if (authPatchCount == 0)
+                Logger.LogError("Could not find a Photon authentication/connect method. Steam auth cannot be applied.");
+
+            Logger.LogInfo("Nekogiri v1.1.0.4 patches installed for the current game version.");
             Logger.LogInfo("Made with <3 By Kirigiri \nhttps://discord.gg/zn2a2A65My");
         }
 
@@ -193,10 +204,81 @@ namespace NekogiriMod
             return true; // Keep the game's original menu startup.
         }
 
-        private static bool AuthTicketPrefix()
+        // Runs immediately before Photon sends its authentication operation.
+        // __args is used instead of hard-coding PUN method parameters because the
+        // LoadBalancingClient signature differs between Photon versions.
+        private static void PhotonOpAuthenticatePrefix(object __instance, object[] __args, MethodBase __originalMethod)
         {
-            if (Instance != null) Instance.CustomAuth();
-            return false; // Nekogiri supplies the configured Photon auth values.
+            if (Instance == null) return;
+            AuthenticationValues authValues = Instance.CreateSteamAuthenticationValues();
+            bool applied = false;
+
+            if (__args != null)
+            {
+                ParameterInfo[] parameters = __originalMethod == null ? new ParameterInfo[0] : __originalMethod.GetParameters();
+                for (int i = 0; i < __args.Length; i++)
+                {
+                    // Replace the argument by declared parameter type, even when the
+                    // game's current argument is null.
+                    if (i < parameters.Length && parameters[i].ParameterType == typeof(AuthenticationValues))
+                    {
+                        __args[i] = authValues;
+                        applied = true;
+                    }
+                }
+            }
+
+            if (__instance != null)
+            {
+                PropertyInfo property = AccessTools.Property(__instance.GetType(), "AuthValues");
+                if (property != null && property.CanWrite)
+                {
+                    property.SetValue(__instance, authValues, null);
+                    applied = true;
+                }
+            }
+
+            if (!applied)
+                PhotonNetwork.AuthValues = authValues;
+
+            Instance.Logger.LogInfo("Applied Steam authentication values immediately before Photon OpAuthenticate.");
+        }
+
+        private static void PhotonConnectPrefix()
+        {
+            if (Instance != null)
+            {
+                PhotonNetwork.AuthValues = Instance.CreateSteamAuthenticationValues();
+                Instance.Logger.LogInfo("Applied Steam authentication values before Photon ConnectUsingSettings.");
+            }
+        }
+
+        private int PatchAllNamedMethods(Harmony harmony, Type targetType, string targetName, string prefixName)
+        {
+            if (targetType == null)
+            {
+                Logger.LogWarning("Could not find type for patch target " + targetName + ".");
+                return 0;
+            }
+
+            MethodInfo prefix = AccessTools.Method(typeof(NekogiriMod), prefixName);
+            if (prefix == null)
+            {
+                Logger.LogError("Could not find Nekogiri prefix " + prefixName + ".");
+                return 0;
+            }
+
+            MethodInfo[] targets = targetType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                .Where(method => method.Name == targetName)
+                .ToArray();
+
+            foreach (MethodInfo target in targets)
+            {
+                harmony.Patch(target, prefix: new HarmonyMethod(prefix));
+                Logger.LogInfo("Patched " + target.DeclaringType.FullName + "." + target.Name + " for Steam authentication.");
+            }
+
+            return targets.Length;
         }
 
         private void PatchIfPresent(Harmony harmony, MethodBase original, string prefixName, bool required)
@@ -222,109 +304,24 @@ namespace NekogiriMod
 
         public void CustomAuth()
         {
-            Logger.LogInfo("Custom Auth method executed!");
-            string configFilePath = Path.Combine(Path.GetDirectoryName(Application.dataPath), "Kirigiri.ini");
-            string authSetting = "Steam"; // Default value for Auth setting if not found or invalid
-            bool useDefaultRepoServers = false;
-
-            try
-            {
-                if (File.Exists(configFilePath))
-                {
-                    // Read all lines from the INI file
-                    var settings = File.ReadAllLines(configFilePath)
-                                       .Where(line => !string.IsNullOrWhiteSpace(line) && !line.StartsWith(";"))
-                                       .Select(line => line.Split('='))
-                                       .Where(parts => parts.Length == 2)
-                                       .ToDictionary(parts => parts[0].Trim(), parts => parts[1].Trim());
-
-                    // Check for UseDefaultRepoServers flag
-                    if (settings.TryGetValue("UseDefaultRepoServers", out string useDefaultValue) && useDefaultValue == "1")
-                    {
-                        useDefaultRepoServers = true;
-                    }
-
-                    // If not using defaults, try to get Auth setting from the INI file
-                    if (!useDefaultRepoServers)
-                    {
-                        if (settings.ContainsKey("Auth"))
-                        {
-                            authSetting = settings["Auth"];
-                        }
-                        else
-                        {
-                            Logger.LogWarning("Auth setting not found in the INI file, defaulting to 'Steam'.");
-                        }
-                    }
-                }
-                else
-                {
-                    Logger.LogWarning($"Settings file not found at {configFilePath}. Using default Auth value 'Steam'.");
-                    useDefaultRepoServers = true; // Use default if the INI file is missing
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError($"Error reading Auth setting from INI: {ex.Message}. Defaulting to 'Steam'.");
-            }
-
-            // Map the string to the corresponding CustomAuthenticationType
-            PhotonNetwork.AuthValues = new AuthenticationValues();
-            PhotonNetwork.AuthValues.UserId = SteamClient.SteamId.ToString();
-
-            CustomAuthenticationType authType = CustomAuthenticationType.Steam; // Default to Steam
-
-            // Check the Auth setting and set the corresponding authentication type
-            switch (authSetting.ToLower())
-            {
-                case "custom":
-                    authType = CustomAuthenticationType.Custom;
-                    break;
-                case "steam":
-                    authType = CustomAuthenticationType.Steam;
-                    break;
-                case "facebook":
-                    authType = CustomAuthenticationType.Facebook;
-                    break;
-                case "oculus":
-                    authType = CustomAuthenticationType.Oculus;
-                    break;
-                case "playstation4":
-                    authType = CustomAuthenticationType.PlayStation4;
-                    break;
-                case "xbox":
-                    authType = CustomAuthenticationType.Xbox;
-                    break;
-                case "viveport":
-                    authType = CustomAuthenticationType.Viveport;
-                    break;
-                case "nintendoswitch":
-                    authType = CustomAuthenticationType.NintendoSwitch;
-                    break;
-                case "playstation5":
-                    authType = CustomAuthenticationType.PlayStation5;
-                    break;
-                case "epic":
-                    authType = CustomAuthenticationType.Epic;
-                    break;
-                case "facebookgaming":
-                    authType = CustomAuthenticationType.FacebookGaming;
-                    break;
-                case "none":
-                default:
-                    authType = CustomAuthenticationType.None;
-                    break;
-            }
-
-            PhotonNetwork.AuthValues.AuthType = authType;
-
-            // Add the Auth parameter (e.g., the Steam ticket)
-            string value = this.GetSteamAuthTicket(out this.steamAuthTicket);
-            PhotonNetwork.AuthValues.AddAuthParameter("ticket", value);
-
-            Logger.LogInfo($"Patched Auth to {PhotonNetwork.AuthValues.AuthType}!");
+            PhotonNetwork.AuthValues = CreateSteamAuthenticationValues();
         }
 
+        private AuthenticationValues CreateSteamAuthenticationValues()
+        {
+            Logger.LogInfo("Preparing Photon Steam authentication...");
+            AuthenticationValues authValues = new AuthenticationValues();
+            authValues.UserId = SteamClient.SteamId.ToString();
+            authValues.AuthType = CustomAuthenticationType.Steam;
+
+            string ticketValue = GetSteamAuthTicket(out this.steamAuthTicket);
+            if (string.IsNullOrWhiteSpace(ticketValue))
+                throw new InvalidOperationException("Steam returned an empty authentication ticket.");
+
+            authValues.AddAuthParameter("ticket", ticketValue);
+            Logger.LogInfo("Photon authentication configured: Type=Steam, UserId=" + authValues.UserId + ", ticket length=" + ticketValue.Length + ".");
+            return authValues;
+        }
 
         private void WelcomeMessage()
         {
